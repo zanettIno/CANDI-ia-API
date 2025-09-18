@@ -1,21 +1,25 @@
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
 import requests
 import json
+import os
 
 # MODELO DOS DADOS; it WILL change
 class DadosPaciente(BaseModel):
     info: str
 
 app = FastAPI()
+load_dotenv()
+API_KEY = os.getenv("KEY")
 
 # FUNC PRINCIPAL PARA A IA
 def infoToAI(data : str):
     response = requests.post(
     url="https://openrouter.ai/api/v1/chat/completions",
     headers={
-        "Authorization": "Bearer <API-KEY>",
+        "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
     },
     data=json.dumps({
@@ -37,5 +41,6 @@ async def main():
 # RECEBIMENTO DOS DADOS
 @app.get("/ai/{info}")
 async def receivingInfo(info: str):
-    # infoToAI(info)
-    return "Ta indo!!"
+    print(info)
+    retorno = infoToAI(info)
+    return retorno
