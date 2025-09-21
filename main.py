@@ -47,6 +47,6 @@ async def main():
 
 # RECEBIMENTO DOS DADOS (EMULACAO)
 @app.get("/ai/")
-async def receivingInfo(info: str):
+async def receivingInfo():
     retorno = infoToAI(cancer)
     return retorno
