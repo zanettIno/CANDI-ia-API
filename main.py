@@ -39,8 +39,14 @@ async def main():
     return "API totalmente no ar!!"
 
 # RECEBIMENTO DOS DADOS
-@app.get("/ai/{info}")
+# @app.get("/ai/{info}")
+# async def receivingInfo(info: str):
+    # print(info)
+    # retorno = infoToAI(info)
+    # return retorno
+
+# RECEBIMENTO DOS DADOS (EMULACAO)
+@app.get("/ai/")
 async def receivingInfo(info: str):
-    print(info)
-    retorno = infoToAI(info)
+    retorno = infoToAI(cancer)
     return retorno
