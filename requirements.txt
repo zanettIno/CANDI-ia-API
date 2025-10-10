@@ -39,3 +39,5 @@ uvicorn==0.35.0
 uvloop==0.21.0
 watchfiles==1.1.0
 websockets==15.0.1
+boto3==1.35.9
+botocore==1.35.9
