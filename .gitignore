@@ -143,3 +143,10 @@ pids
 .yarn-integrity
 
 *.claude
+
+.pytest_cache/
+cover/
+
+# Local test files
+test_integration.py
+test_local.py

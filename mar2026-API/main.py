@@ -9,6 +9,7 @@ from google import genai
 from dotenv import load_dotenv
 import boto3
 from botocore.exceptions import ClientError
+from botocore.config import Config
 import json
 import os
 
@@ -19,16 +20,10 @@ logger.setLevel(logging.INFO)
 
 client = genai.Client(api_key=os.getenv("CHAVE_API"))
 
-AWS_ACCESS_KEY_ID = os.getenv("aws_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("aws_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("aws_REGION", "us-east-1")
-
 dynamodb = boto3.resource(
     'dynamodb',
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION,
-    config=boto3.session.Config(
+    region_name=os.getenv('AWS_REGION', 'us-east-1'),  
+    config=Config(
         connect_timeout=5,
         read_timeout=5,
         retries={'max_attempts': 2}
@@ -37,6 +32,7 @@ dynamodb = boto3.resource(
 
 sentimentos_tabela = dynamodb.Table('CANDIFeelings')
 sintomas_tabela = dynamodb.Table('CANDISymptoms')
+profiles_tabela = dynamodb.Table('CANDIProfile')
 
 # ─────────────────────────────────────────────
 # >> Anonimização do profile_id
@@ -269,6 +265,56 @@ def fetch_dynamodb_items_by_profile(tabela, profile_id, limit):
     except ClientError as e:
         logger.error(f"Erro ao receber as informações da tabela {tabela.name}: {e}", exc_info=True)
         return []
+    
+# ─────────────────────────────────────────────
+# >> Funcionamento semanal do Lambda
+# 
+
+def fetch_profile(profile_id: str) -> dict | None:
+    """Fetches a single CANDIProfile item by profile_id (primary key)."""
+    try:
+        response = profiles_tabela.get_item(Key={'profile_id': profile_id})
+        return response.get('Item')
+    except ClientError as e:
+        logger.error(f"Erro ao buscar perfil {profile_id}: {e}", exc_info=True)
+        return None
+
+
+def save_last_summary(profile_id: str, summary: dict) -> bool:
+    """
+    Persists the AI summary JSON into CANDIProfile.lastSummary.
+    Also stamps lastSummaryAt with the current UTC ISO timestamp.
+    Returns True on success, False on failure.
+    """
+    try:
+        profiles_tabela.update_item(
+            Key={'profile_id': profile_id},
+            UpdateExpression="SET lastSummary = :s, lastSummaryAt = :t",
+            ExpressionAttributeValues={
+                ':s': summary,
+                ':t': datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+        )
+        return True
+    except ClientError as e:
+        logger.error(f"Erro ao salvar summary para {profile_id}: {e}", exc_info=True)
+        return False
+    
+
+def fetch_weekly_profile_ids() -> list[str]:
+    """
+    Returns all profile_ids where isWeekly is True.
+    Used exclusively by the scheduled weekly trigger.
+    """
+    try:
+        response = profiles_tabela.scan(
+            FilterExpression=boto3.dynamodb.conditions.Attr('isWeekly').eq(True),
+            ProjectionExpression='profile_id'
+        )
+        return [item['profile_id'] for item in response.get('Items', [])]
+    except ClientError as e:
+        logger.error(f"Erro ao escanear perfis semanais: {e}", exc_info=True)
+        return []
 
 # ─────────────────────────────────────────────
 # >> Sanitização do output da IA
@@ -483,11 +529,21 @@ REGRAS CRÍTICAS:
 
 def lambda_handler(event, context):
     """
-    AWS Lambda Entry Point
-    Expects: event = { "uid": "<profile_id>" }
+    AWS Lambda Entry Point — three modes:
+
+    MODE A — Health check:
+        event = { "path": "/" }
+
+    MODE B — Manual / on-demand (called from mobile app):
+        event = { "uid": "<profile_id>" }
+        Runs regardless of isWeekly. Saves result to lastSummary.
+
+    MODE C — Weekly scheduled batch (triggered by EventBridge):
+        event = { "source": "candi.weekly-scheduler" }
+        Iterates all profiles where isWeekly=True and runs the pipeline for each.
     """
     try:
-        # Handle simple health check
+        # ── MODE A: Health check ─────────────────────────────────────────
         if event.get("path") == "/":
             try:
                 sentimentos_tabela.table_status
@@ -512,51 +568,37 @@ def lambda_handler(event, context):
                     })
                 }
 
-        # MAIN AI LOGIC
-        profile_id = event.get("uid") or event.get("pathParameters", {}).get("profile_id")
+        # ── MODE C: Weekly scheduled batch ───────────────────────────────
+        if event.get("source") == "candi.weekly-scheduler":
+            logger.info("Modo batch semanal iniciado.")
+            profile_ids = fetch_weekly_profile_ids()
+            results = {"processed": 0, "skipped": 0, "errors": 0}
+
+            for pid in profile_ids:
+                try:
+                    outcome = _run_insight_pipeline(pid, save=True)
+                    if outcome["statusCode"] == 200:
+                        results["processed"] += 1
+                    elif outcome["statusCode"] == 404:
+                        results["skipped"] += 1
+                    else:
+                        results["errors"] += 1
+                except Exception as e:
+                    logger.error(f"Erro no pipeline para {pid}: {e}", exc_info=True)
+                    results["errors"] += 1
+
+            logger.info(f"Batch semanal concluído: {results}")
+            return {"statusCode": 200, "body": json.dumps(results)}
+
+        # ── MODE B: Manual on-demand ──────────────────────────────────────
+        profile_id = event.get("uid") or (event.get("pathParameters") or {}).get("profile_id")
         if not profile_id:
             return {
                 "statusCode": 400,
                 "body": json.dumps({"error": "Missing uid or profile_id"})
             }
 
-        limit = 6
-        sentimentos_data = fetch_dynamodb_items_by_profile(sentimentos_tabela, profile_id, limit)
-        sintomas_data    = fetch_dynamodb_items_by_profile(sintomas_tabela,    profile_id, limit)
-
-        if not sentimentos_data and not sintomas_data:
-            return {
-                "statusCode": 404,
-                "body": json.dumps({
-                    "error": "Nenhum dado encontrado para o usuário informado."
-                })
-            }
-
-        # 1.1 + 1.2 + 2.1 + 2.2 + 3.1 aplicados dentro de convert_to_ai_format
-        data_structured = convert_to_ai_format(sentimentos_data, sintomas_data, profile_id)
-        ai_resposta     = generate_ai_insight(data_structured)
-
-        try:
-            ai_json = json.loads(ai_resposta)
-            # 1.3 — segunda passagem de sanitização no output da IA
-            ai_json = sanitize_ai_output(ai_json)
-        except json.JSONDecodeError:
-            ai_json = {
-                "resposta_bruta": sanitize_free_text(ai_resposta),
-                "erro_parse": True
-            }
-
-        return {
-            "statusCode": 200,
-            "body": json.dumps({
-                "entries_analyzed": {
-                    "sentimentos": len(sentimentos_data),
-                    "sintomas":    len(sintomas_data)
-                },
-                "ai_analysis": ai_json,
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
-            }, ensure_ascii=False)
-        }
+        return _run_insight_pipeline(profile_id, save=True)
 
     except ClientError as e:
         logger.error(f"AWS ClientError: {e}", exc_info=True)
@@ -567,7 +609,6 @@ def lambda_handler(event, context):
                 "codigo": "STORAGE_ERROR"
             })
         }
-
     except Exception as e:
         logger.error(f"Erro inesperado no lambda_handler: {e}", exc_info=True)
         return {
@@ -577,3 +618,50 @@ def lambda_handler(event, context):
                 "codigo": "INTERNAL_ERROR"
             })
         }
+
+
+def _run_insight_pipeline(profile_id: str, save: bool = False) -> dict:
+    """
+    Core pipeline: fetch → structure → generate AI insight → optionally save.
+    Extracted so both manual (Mode B) and batch (Mode C) reuse the same logic.
+    """
+    limit = 6
+    sentimentos_data = fetch_dynamodb_items_by_profile(sentimentos_tabela, profile_id, limit)
+    sintomas_data    = fetch_dynamodb_items_by_profile(sintomas_tabela,    profile_id, limit)
+
+    if not sentimentos_data and not sintomas_data:
+        return {
+            "statusCode": 404,
+            "body": json.dumps({
+                "error": "Nenhum dado encontrado para o usuário informado."
+            })
+        }
+
+    data_structured = convert_to_ai_format(sentimentos_data, sintomas_data, profile_id)
+    ai_resposta     = generate_ai_insight(data_structured)
+
+    try:
+        ai_json = json.loads(ai_resposta)
+        ai_json = sanitize_ai_output(ai_json)
+    except json.JSONDecodeError:
+        ai_json = {
+            "resposta_bruta": sanitize_free_text(ai_resposta),
+            "erro_parse": True
+        }
+
+    if save:
+        saved = save_last_summary(profile_id, ai_json)
+        if not saved:
+            logger.warning(f"Não foi possível salvar o summary para {profile_id}")
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "entries_analyzed": {
+                "sentimentos": len(sentimentos_data),
+                "sintomas":    len(sintomas_data)
+            },
+            "ai_analysis": ai_json,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }, ensure_ascii=False)
+    }
